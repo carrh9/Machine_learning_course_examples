@@ -1,0 +1,802 @@
+---
+title: "Human metagenomics dataset"
+output: html_document
+date: "2024-09-19"
+---
+
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+theme_set(theme_bw()) 
+
+```
+
+# Metagenomics data 
+
+Read in data - this is from https://www.kaggle.com/datasets/antaresnyc/human-metagenomics/data which is a dataset produced in: Pasolli E, et al. (2016) Machine Learning Meta-analysis of Large Metagenomic Datasets: Tools and Biological Insights. PLoS Comput Biol 12(7): e1004977. 
+
+
+```{r message=FALSE, warning=FALSE}
+metagen_data <- read_csv("../potential_datasets/HumanMetagenomics/abundance.csv")
+
+metagen_data %>% nrow()
+metagen_data %>% ncol()
+```
+Have a look at diseases and numbers 
+
+```{r}
+metagen_data %>%
+  group_by(disease) %>%
+  tally() %>%
+  arrange(desc(n))
+
+metagen_data %>%
+  na.omit %>%
+  nrow()
+```
+
+Try having a look at T2D data, as largest number included in dataset
+
+```{r}
+metagen_data %>%
+  filter(disease == "t2d") %>%
+  group_by(dataset_name) %>%
+  tally()
+t2d_data_all <- metagen_data %>%
+  filter(dataset_name %in% c("t2dmeta_long", "t2dmeta_short", "WT2D"))
+t2d_data_all <- t2d_data_all %>%
+  mutate(gender = ifelse(dataset_name=="WT2D","female",gender))
+head(t2d_data_all,50)
+t2d_data_all %>%
+  nrow()
+```
+
+Missing data filled as "-", remove those without disease state
+
+```{r}
+t2d_data_all <- t2d_data_all %>%
+  filter(disease != "-")
+head(t2d_data_all,20)
+
+```
+
+Remove columns that are the same in whole dataset/not of interest
+
+```{r}
+t2d_data_all <- t2d_data_all %>%
+  select(-c(bodysite, sequencing_technology:hitchip_probe_number, gene_count_class:weight, sbp:tcho, 
+            kit:`y-gt`, fasting_insulin:group))
+
+t2d_data_all <- t2d_data_all %>%
+  mutate(fasting_glucose = ifelse(fbg=="nd",fasting_glucose, fbg),
+         fbg = NULL)
+head(t2d_data_all,20)
+
+```
+
+Ensure numeric columns are numeric and remove missing data
+
+```{r message=FALSE, warning=FALSE}
+t2d_data_all <- t2d_data_all %>%
+  mutate(age = as.numeric(age),
+         bmi = as.numeric(bmi),
+         hdl = as.numeric(hdl),
+         ldl = as.numeric(ldl),
+         fasting_glucose = as.numeric(fasting_glucose))
+
+t2d_data_all <- t2d_data_all %>%
+  na.omit()
+```
+
+Remove sample and subject IDs and diabetic column (repeat of disease). Also remove impaired glucose tolerance as a disease category for simplicity. Convert remaining categories to factors
+
+```{r}
+t2d_data_all <- t2d_data_all %>%
+  select(-c(sampleID, subjectID, diabetic)) %>%
+  filter(disease != "impaired_glucose_tolerance")
+t2d_data_all <- t2d_data_all %>%
+  mutate(disease=factor(disease),
+         gender=factor(gender))
+
+```
+
+Filter microbes missing in >50% of samples and pull out species-level information.
+
+```{r}
+t2d_data_all_l <- t2d_data_all %>%
+  pivot_longer(k__Archaea:last_col(), names_to = "microbe", values_to = "abundance")
+
+t2d_perfilt_l <- t2d_data_all_l %>%
+  group_by(microbe) %>%
+  mutate(sum_miss = sum(abundance==0),
+         perc_miss = sum_miss*100/242) %>%
+  ungroup() %>%
+  filter(perc_miss <50)
+
+t2d_species_l <- t2d_perfilt_l %>%
+  filter(str_count(microbe, "\\|")>5 &
+           str_count(microbe, "\\|")<7)
+
+t2d_species_l <- t2d_species_l %>%
+  mutate(species = str_extract(microbe,"s__.*"),
+         species = str_remove(species,"s__"))
+
+t2d_species <- t2d_species_l %>%
+  select(-c(sum_miss, perc_miss, microbe)) %>%
+  pivot_wider(names_from = species, values_from = abundance)
+head(t2d_species)
+
+
+```
+
+Filter out impaired glucose tolerance - but might be interesting to test any models created on these later, to see if classifies as T2D or not. 
+
+```{r}
+t2d_data_all %>%
+  filter(disease == "impaired_glucose_tolerance")
+t2d_data_all %>%
+  filter(dataset_name == "WT2D") %>%
+  group_by(disease) %>%
+  tally()
+```
+
+
+## Look at distribution of parameters
+
+Clinical parameters - not including in model for now, but might be interesting to compare to later.
+
+```{r}
+t2d_data_all %>%
+#  filter(disease != "impaired_glucose_tolerance") %>%
+  ggplot(aes(x=age, fill=disease)) +
+  geom_density(alpha=0.4) +
+  theme_bw()
+t2d_data_all %>%
+#  filter(disease != "impaired_glucose_tolerance") %>%
+  ggplot(aes(x=bmi, fill=disease)) +
+  geom_density(alpha=0.4)
+t2d_data_all %>%
+#  filter(disease != "impaired_glucose_tolerance") %>%
+  ggplot(aes(x=fasting_glucose, fill=disease)) +
+  geom_density(alpha=0.4)
+t2d_data_all %>%
+#  filter(disease != "impaired_glucose_tolerance") %>%
+  ggplot(aes(x=log2(fasting_glucose), fill=disease)) +
+  geom_density(alpha=0.4)
+t2d_data_all %>%
+#  filter(disease != "impaired_glucose_tolerance") %>%
+  ggplot(aes(x=hdl, fill=disease)) +
+  geom_density(alpha=0.4)
+t2d_data_all %>%
+#  filter(disease != "impaired_glucose_tolerance") %>%
+  ggplot(aes(x=ldl, fill=disease)) +
+  geom_density(alpha=0.4)
+
+```
+
+Have a look at correlation between variables to remove any that are highly correlated.
+
+```{r fig.height=12, fig.width=12}
+#library(corrplot)
+t2d_clin_cor <- cor(t2d_data_all %>% select(c(age, bmi:ldl)), method = c("spearman"))
+#corrplot(t2d_clin_cor)
+
+t2d_clin_cor[!lower.tri(t2d_clin_cor)] <- NA # remove diagonal and redundant values
+data.frame(t2d_clin_cor) %>%
+              rownames_to_column() %>%
+              gather(key="variable", value="correlation", -rowname) %>%
+              filter(abs(correlation) > 0.8)
+
+t2d_species_cor <- cor(t2d_species %>% select(c(Bacteroides_caccae:last_col())), method = c("spearman"))
+
+t2d_species_cor[!lower.tri(t2d_species_cor)] <- NA # remove diagonal and redundant values
+data.frame(t2d_species_cor) %>%
+              rownames_to_column() %>%
+              gather(key="variable", value="correlation", -rowname) %>%
+              filter(abs(correlation) > 0.8)
+
+```
+
+None found that seem like they would be an issue.
+
+Look at distribution of microbe abundance - would this be better on a log scale? 
+
+```{r}
+t2d_species_l %>%
+  ggplot(aes(x=abundance)) +
+  geom_density(alpha=0.4, show.legend = FALSE) +
+  theme_bw()
+t2d_species_l %>%
+  ggplot(aes(x=log2(abundance))) +
+  geom_density(alpha=0.4, show.legend = FALSE) +
+  theme_bw()
+
+```
+
+Want to use log abundance, so log transform in dataset
+
+```{r}
+t2d_data_all_l %>%
+  filter(abundance>0) %>%
+  arrange(abundance) %>%
+  head()
+t2d_species_log <- t2d_species_l %>%
+  mutate(log_abundance = log2(abundance+3e-05),
+         abundance= NULL,
+         microbe=NULL,
+         sum_miss=NULL,
+         perc_miss=NULL) %>%
+  pivot_wider(names_from = species, values_from = log_abundance)
+head(t2d_species_log)
+```
+
+
+## Pull out different datasets
+
+Plan to use t2dmeta_long for training and t2dmeta_short for testing - both are from the same study. WT2D is a completely separate dataset from a different study that could be interesting to look at as an external test. 
+
+```{r}
+t2d_species_train <- t2d_species_log %>%
+  filter(dataset_name == "t2dmeta_long") %>%
+  select(-c(dataset_name, country))
+t2d_species_short <- t2d_species_log %>%
+  filter(dataset_name == "t2dmeta_short") %>%
+  select(-c(dataset_name, country))
+t2d_species_wtd <- t2d_species_log %>%
+  filter(dataset_name == "WT2D") %>%
+  select(-c(dataset_name, country))
+
+t2d_meta_train <- t2d_species_log %>%
+  filter(dataset_name == "t2dmeta_long") %>%
+  select(-c(dataset_name, country)) %>%
+  select(disease, Eggerthella_unclassified:last_col())
+t2d_meta_short <- t2d_species_log %>%
+  filter(dataset_name == "t2dmeta_short") %>%
+  select(-c(dataset_name, country)) %>%
+  select(disease, Eggerthella_unclassified:last_col())
+t2d_meta_wtd <- t2d_species_log %>%
+  filter(dataset_name == "WT2D") %>%
+  select(-c(dataset_name, country)) %>%
+  select(disease, Eggerthella_unclassified:last_col())
+
+```
+
+# Set up model
+
+Create recipe
+
+```{r}
+t2d_rec <- 
+  recipe(disease ~ ., data = t2d_meta_train) %>% 
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) 
+
+```
+
+## Logistic regression
+
+Set up model
+
+```{r}
+lr_mod <- 
+  logistic_reg() %>% 
+  set_engine("glm")
+
+```
+
+Create workflow
+
+```{r}
+lr_wflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(t2d_rec)
+lr_wflow
+```
+
+Train model
+
+```{r}
+lr_fit <- 
+  lr_wflow %>% 
+  fit(data = t2d_meta_train)
+```
+
+Predict training data
+
+```{r}
+# Evaluate the model
+lr_train_predictions <- predict(lr_fit, new_data = t2d_meta_train) %>%
+  bind_cols(t2d_meta_train) %>%
+  select(.pred_class, disease)
+
+lr_train_predictions
+
+# can make into nicer looking table
+lr_train_predictions %>%
+  group_by(.pred_class, disease) %>%
+  count() %>%
+  pivot_wider(names_from = .pred_class,
+              values_from = n,
+              names_prefix = "predicted_") %>%
+  rename(true_disease = disease)
+
+# calculate specific metrics
+
+lr_train_predictions %>%
+  metrics(disease, .pred_class)
+lr_train_predictions %>%
+  sens(disease, .pred_class)
+lr_train_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+Predict test data
+
+```{r}
+# Evaluate the model
+lr_predictions <- predict(lr_fit, new_data = t2d_meta_short) %>%
+  bind_cols(t2d_meta_short) %>%
+  select(.pred_class, disease)
+
+lr_predictions
+
+# can make into nicer looking table
+lr_predictions %>%
+  group_by(.pred_class, disease) %>%
+  count() %>%
+  pivot_wider(names_from = .pred_class,
+              values_from = n,
+              names_prefix = "predicted_") %>%
+  rename(true_disease = disease)
+
+# calculate specific metrics
+
+lr_predictions %>%
+  metrics(disease, .pred_class)
+lr_predictions %>%
+  sens(disease, .pred_class)
+lr_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+## Random forest
+
+Build model 
+
+```{r}
+rf_mod <- 
+  rand_forest(trees = 100) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+```
+
+Train model
+
+```{r}
+set.seed(234)
+rf_fit <- 
+  rf_mod %>% 
+  fit(disease ~ ., data = t2d_meta_train)
+rf_fit
+```
+
+Predict training data
+
+```{r}
+rf_training_pred <- rf_fit %>%
+  predict(t2d_meta_train) %>%
+  bind_cols(t2d_meta_train)
+
+rf_training_pred %>%
+  metrics(disease, .pred_class)
+rf_training_pred %>%
+  sens(disease, .pred_class) #gives sensitivity
+rf_training_pred %>%
+  spec(disease, .pred_class) #gives specificity
+
+```
+
+Predict testing data
+
+```{r}
+rf_testing_pred <- rf_fit %>%
+  predict(t2d_meta_short) %>%
+  bind_cols(t2d_meta_short)
+
+rf_testing_pred %>%
+  sens(disease, .pred_class) #gives sensitivity
+rf_testing_pred %>%
+  spec(disease, .pred_class) #gives specificity
+
+rf_testing_pred %>%
+  metrics(disease, .pred_class)
+```
+
+
+## KNN
+
+Build model
+
+```{r}
+knn_mod <- nearest_neighbor(neighbors = 5, weight_func = "triangular") %>%
+  set_mode("classification") %>%
+  set_engine("kknn")
+```
+
+Create workflow
+
+```{r}
+knn_wflow <- 
+  workflow() %>% 
+  add_model(knn_mod) %>% 
+  add_recipe(t2d_rec)
+knn_wflow
+```
+
+Train model
+
+```{r}
+knn_fit <- 
+  knn_wflow %>% 
+  fit(data = t2d_meta_train)
+```
+
+Predict training data
+
+```{r}
+# Evaluate the model
+knn_train_predictions <- predict(knn_fit, new_data = t2d_meta_train) %>%
+  bind_cols(t2d_meta_train) %>%
+  select(.pred_class, disease)
+
+knn_train_predictions
+
+# can make into nicer looking table
+knn_train_predictions %>%
+  group_by(.pred_class, disease) %>%
+  count() %>%
+  pivot_wider(names_from = .pred_class,
+              values_from = n,
+              names_prefix = "predicted_") %>%
+  rename(true_disease = disease)
+
+# calculate specific metrics
+
+knn_train_predictions %>%
+  metrics(disease, .pred_class)
+knn_train_predictions %>%
+  sens(disease, .pred_class)
+knn_train_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+Predict test data
+
+```{r}
+# Evaluate the model
+knn_predictions <- predict(knn_fit, new_data = t2d_meta_short) %>%
+  bind_cols(t2d_meta_short) %>%
+  select(.pred_class, disease)
+
+knn_predictions
+
+# can make into nicer looking table
+knn_predictions %>%
+  group_by(.pred_class, disease) %>%
+  count() %>%
+  pivot_wider(names_from = .pred_class,
+              values_from = n,
+              names_prefix = "predicted_") %>%
+  rename(true_disease = disease)
+
+# calculate specific metrics
+
+knn_predictions %>%
+  metrics(disease, .pred_class)
+knn_predictions %>%
+  sens(disease, .pred_class)
+knn_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+# Test models on WT2D data?
+
+LR
+
+```{r}
+lr_predictions <- predict(lr_fit, new_data = t2d_meta_wtd) %>%
+  bind_cols(t2d_meta_wtd) %>%
+  select(.pred_class, disease)
+
+lr_predictions %>%
+  metrics(disease, .pred_class)
+lr_predictions %>%
+  sens(disease, .pred_class)
+lr_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+
+```{r}
+rf_testing_pred <- predict(rf_fit, new_data = t2d_meta_wtd) %>%
+  bind_cols(t2d_meta_wtd) %>%
+  select(.pred_class, disease)
+
+rf_testing_pred %>%
+  metrics(disease, .pred_class)
+rf_testing_pred %>%
+  sens(disease, .pred_class) #gives sensitivity
+rf_testing_pred %>%
+  spec(disease, .pred_class) #gives specificity
+
+```
+
+
+```{r}
+# Evaluate the model
+knn_predictions <- predict(knn_fit, new_data = t2d_meta_wtd) %>%
+  bind_cols(t2d_meta_wtd) %>%
+  select(.pred_class, disease)
+
+knn_predictions %>%
+  metrics(disease, .pred_class)
+knn_predictions %>%
+  sens(disease, .pred_class)
+knn_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+## Decision tree with tuning
+
+Set up tuning specification
+
+```{r}
+tune_spec <- 
+  decision_tree(
+    cost_complexity = tune(),
+    tree_depth = tune()
+  ) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+tune_spec
+```
+
+Create grid for test values
+
+```{r}
+tree_grid <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = 5)
+```
+
+Set up cross-validation folds
+
+```{r}
+set.seed(234)
+t2d_folds <- vfold_cv(t2d_meta_train)
+```
+
+Set up model
+
+```{r}
+set.seed(345)
+
+tree_wf <- workflow() %>%
+  add_model(tune_spec) %>%
+  add_formula(disease ~ .)
+
+tree_res <- 
+  tree_wf %>% 
+  tune_grid(
+    resamples = t2d_folds,
+    grid = tree_grid
+    )
+
+tree_res
+```
+
+Explore results of tuning
+
+```{r}
+tree_res %>% 
+  collect_metrics()
+
+tree_res %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(linewidth = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+
+tree_res %>%
+  show_best(metric = "accuracy")
+
+best_tree <- tree_res %>%
+  select_best(metric = "accuracy")
+
+best_tree
+```
+
+Finalise workflow based on best tree
+
+```{r}
+final_wf <- 
+  tree_wf %>% 
+  finalize_workflow(best_tree)
+```
+
+Final fit
+
+```{r}
+final_fit <- 
+  final_wf %>%
+  fit(t2d_meta_train)
+
+```
+
+Predict training data
+
+```{r}
+# Evaluate the model
+final_tree_predictions <- predict(final_fit, new_data = t2d_meta_train) %>%
+  bind_cols(t2d_meta_train) %>%
+  select(.pred_class, disease)
+
+final_tree_predictions
+
+# can make into nicer looking table
+final_tree_predictions %>%
+  group_by(.pred_class, disease) %>%
+  count() %>%
+  pivot_wider(names_from = .pred_class,
+              values_from = n,
+              names_prefix = "predicted_") %>%
+  rename(true_disease = disease)
+
+# calculate specific metrics
+
+final_tree_predictions %>%
+  metrics(disease, .pred_class)
+final_tree_predictions %>%
+  sens(disease, .pred_class)
+final_tree_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+Predict test data
+
+```{r}
+# Evaluate the model
+final_tree_predictions <- predict(final_fit, new_data = t2d_meta_short) %>%
+  bind_cols(t2d_meta_short) %>%
+  select(.pred_class, disease)
+
+final_tree_predictions
+
+# can make into nicer looking table
+final_tree_predictions %>%
+  group_by(.pred_class, disease) %>%
+  count() %>%
+  pivot_wider(names_from = .pred_class,
+              values_from = n,
+              names_prefix = "predicted_") %>%
+  rename(true_disease = disease)
+
+# calculate specific metrics
+
+final_tree_predictions %>%
+  metrics(disease, .pred_class)
+final_tree_predictions %>%
+  sens(disease, .pred_class)
+final_tree_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+Extract and visualise tree
+
+```{r message=FALSE, warning=FALSE}
+library(rpart.plot)
+library(vip)
+```
+
+
+```{r}
+final_fit
+
+final_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot(roundint = FALSE)
+```
+
+```{r fig.height=3, fig.width=5}
+final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+```
+
+# Compare model performance on t2d short data
+
+```{r}
+lr_predictions <- predict(lr_fit, new_data = t2d_meta_short) %>%
+  bind_cols(t2d_meta_short) %>%
+  select(.pred_class, disease)
+lr_met <- lr_predictions %>%
+  metrics(disease, .pred_class)
+lr_sens <- lr_predictions %>%
+  sens(disease, .pred_class)
+lr_spec <- lr_predictions %>%
+  spec(disease, .pred_class)
+
+rf_testing_pred <- rf_fit %>%
+  predict(t2d_meta_short) %>%
+  bind_cols(t2d_meta_short)
+rf_met <- rf_testing_pred %>%
+  metrics(disease, .pred_class)
+rf_sens <- rf_testing_pred %>%
+  sens(disease, .pred_class)
+rf_spec <- rf_testing_pred %>%
+  spec(disease, .pred_class)
+
+knn_predictions <- predict(knn_fit, new_data = t2d_meta_short) %>%
+  bind_cols(t2d_meta_short) %>%
+  select(.pred_class, disease)
+knn_met <- knn_predictions %>%
+  metrics(disease, .pred_class)
+knn_sens <- knn_predictions %>%
+  sens(disease, .pred_class)
+knn_spec <- knn_predictions %>%
+  spec(disease, .pred_class)
+
+final_tree_predictions <- predict(final_fit, new_data = t2d_meta_short) %>%
+  bind_cols(t2d_meta_short) %>%
+  select(.pred_class, disease)
+tree_met <- final_tree_predictions %>%
+  metrics(disease, .pred_class)
+tree_sens <- final_tree_predictions %>%
+  sens(disease, .pred_class)
+tree_spec <- final_tree_predictions %>%
+  spec(disease, .pred_class)
+
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+met_comp <- rbind(lr_met, rf_met, knn_met, tree_met) %>%
+  mutate(model = c("LogReg", "LogReg", "RandFor","RandFor", "knn","knn", "DTree", "DTree"))
+sens_comp <- rbind(lr_sens, rf_sens, knn_sens, tree_sens) %>%
+  mutate(model = c("LogReg", "RandFor", "knn", "DTree"))
+spec_comp <- rbind(lr_spec, rf_spec, knn_spec, tree_spec) %>%
+  mutate(model = c("LogReg", "RandFor", "knn", "DTree"))
+
+eval_para <- full_join(met_comp, sens_comp) %>%
+  full_join(spec_comp) %>%
+  select(-.estimator)
+eval_para
+```
+
+```{r fig.height=3, fig.width=5}
+eval_para %>%
+  ggplot(aes(x=.metric, y=.estimate, group=model, colour=model)) +
+  geom_point()+
+  geom_line()
+```
+
+
+
+
